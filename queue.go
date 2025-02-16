@@ -20,6 +20,8 @@ type (
 		r, w int64
 
 		closed bool
+
+		FullMsg bool
 	}
 
 	slot struct {
@@ -28,7 +30,7 @@ type (
 	}
 
 	Message struct {
-		Msg        int
+		Msg        int64
 		Start, End int
 	}
 
@@ -95,7 +97,7 @@ func (q *Queue) Reset(n, buf int) {
 	q.closed = false
 }
 
-func (q *Queue) Allocate(size, align int, blocking bool) (msg, st, end int) {
+func (q *Queue) Allocate(size, align int, blocking bool) (msg int64, st, end int) {
 	if align > 0 {
 		align = 1 << bits.Len(uint(align)-1)
 	}
@@ -120,7 +122,7 @@ func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int)
 			return n
 		}
 		if msg < 0 {
-			return msg
+			return int(msg)
 		}
 
 		buf[n] = Message{
@@ -135,7 +137,7 @@ func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int)
 	return n
 }
 
-func (q *Queue) allocate(size, align int, blocking bool) (msg, st, end int) {
+func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int) {
 	//	defer func() {
 	//		log.Printf("allocate %5v -> %3x  from %v %v %v", blocking, msg, caller(1), caller(2), caller(3))
 	//	}()
@@ -163,10 +165,10 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg, st, end int) {
 			continue
 		}
 
-		qmask := len(q.q) - 1
+		qmask := int64(len(q.q) - 1)
 		mask := int(q.b) - 1
 
-		msg := int(q.qw) & qmask
+		msg := q.qw & qmask
 		q.qw++
 
 		q.q[msg] = slot{start: q.w, size: sizeWriting}
@@ -180,7 +182,7 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg, st, end int) {
 	}
 }
 
-func (q *Queue) Commit(msg, size int) {
+func (q *Queue) Commit(msg int64, size int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
@@ -196,7 +198,7 @@ func (q *Queue) CommitN(ms []Message) {
 	}
 }
 
-func (q *Queue) commit(msg, size int) {
+func (q *Queue) commit(msg int64, size int) {
 	if size < 0 {
 		size = Cancel
 	}
@@ -207,14 +209,22 @@ func (q *Queue) commit(msg, size int) {
 
 	q.q[msg].size = size
 
+	if msg == q.qr && msg+1 == q.qw {
+		if size == Cancel {
+			q.w = q.r
+		} else {
+			q.w = q.q[msg].start + int64(size)
+		}
+	}
+
 	if size == Cancel {
-		q.done()
+		q.done(msg)
 	} else {
 		q.cond.Broadcast()
 	}
 }
 
-func (q *Queue) Consume(blocking bool) (msg, st, end int) {
+func (q *Queue) Consume(blocking bool) (msg int64, st, end int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
@@ -231,7 +241,7 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 			return n
 		}
 		if msg < 0 {
-			return msg
+			return int(msg)
 		}
 
 		buf[n] = Message{
@@ -246,15 +256,13 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 	return n
 }
 
-func (q *Queue) consume(blocking bool) (msg, st, end int) {
-	qmask := len(q.q) - 1
+func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
+	qmask := int64(len(q.q) - 1)
 	mask := int(q.b - 1)
 
 	for {
 		for msg := q.qr; msg < q.qw; msg++ {
-			m := int(msg) & qmask
-
-			s := q.q[m]
+			s := q.q[msg&qmask]
 			if s.size < 0 {
 				continue
 			}
@@ -262,9 +270,9 @@ func (q *Queue) consume(blocking bool) (msg, st, end int) {
 			st := int(s.start) & mask
 			end := st + s.size
 
-			q.q[m].size = sizeReading
+			q.q[msg&qmask].size = sizeReading
 
-			return m, st, end
+			return msg & qmask, st, end
 		}
 
 		if q.qr == q.qw && q.closed {
@@ -279,16 +287,20 @@ func (q *Queue) consume(blocking bool) (msg, st, end int) {
 	}
 }
 
-func (q *Queue) Done(msg int) {
+func (q *Queue) Done(msg int64) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
 	q.q[msg].size = sizeFree
 
-	q.done()
+	q.done(msg)
 }
 
 func (q *Queue) DoneN(ms []Message) {
+	if len(ms) == 0 {
+		return
+	}
+
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
@@ -296,11 +308,15 @@ func (q *Queue) DoneN(ms []Message) {
 		q.q[m.Msg].size = sizeFree
 	}
 
-	q.done()
+	q.done(q.qr)
 }
 
-func (q *Queue) done() {
+func (q *Queue) done(msg int64) {
 	qmask := len(q.q) - 1
+
+	if int(msg^q.qr)&qmask != 0 {
+		return
+	}
 
 	for q.qr < q.qw {
 		msg := int(q.qr) & qmask
@@ -408,7 +424,7 @@ func ToError(msg int64) error {
 func (e ErrorCode) Error() string {
 	switch e {
 	case Closed:
-		return "closed"
+		return "queue is closed"
 	case WouldBlock:
 		return "would block"
 	default:
