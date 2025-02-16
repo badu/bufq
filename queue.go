@@ -2,6 +2,9 @@ package bufq
 
 import (
 	"fmt"
+	"math/bits"
+	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -22,6 +25,11 @@ type (
 	slot struct {
 		start int64
 		size  int
+	}
+
+	Message struct {
+		Msg        int
+		Start, End int
 	}
 
 	ErrorCode int
@@ -88,24 +96,61 @@ func (q *Queue) Reset(n, buf int) {
 }
 
 func (q *Queue) Allocate(size, align int, blocking bool) (msg, st, end int) {
-	if align&(align-1) != 0 {
-		panic(align)
+	if align > 0 {
+		align = 1 << bits.Len(uint(align)-1)
 	}
 
 	defer q.mu.Unlock()
 	q.mu.Lock()
+
+	return q.allocate(size, align, blocking)
+}
+
+func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int) {
+	if align > 0 {
+		align = 1 << bits.Len(uint(align)-1)
+	}
+
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	for n < len(buf) {
+		msg, st, end := q.allocate(size, align, blocking && n == 0)
+		if msg < 0 && n > 0 {
+			return n
+		}
+		if msg < 0 {
+			return msg
+		}
+
+		buf[n] = Message{
+			Msg:   msg,
+			Start: st,
+			End:   end,
+		}
+
+		n++
+	}
+
+	return n
+}
+
+func (q *Queue) allocate(size, align int, blocking bool) (msg, st, end int) {
+	//	defer func() {
+	//		log.Printf("allocate %5v -> %3x  from %v %v %v", blocking, msg, caller(1), caller(2), caller(3))
+	//	}()
 
 	for {
 		if q.closed {
 			return Closed, 0, 0
 		}
 
-		if a := int64(align); a != 0 && q.w&a != 0 {
-			q.w = q.w&^(a-1) + a
+		if a := int64(align); a != 0 && q.w&(a-1) != 0 {
+			q.w = q.w - q.w&(a-1) + a
 		}
 
-		if q.b != 0 && q.w&q.b+int64(size) > q.b {
-			q.w = q.w - (q.w & q.b) + q.b
+		if q.b != 0 && q.w&(q.b-1)+int64(size) > q.b {
+			q.w = q.w - q.w&(q.b-1) + q.b
 		}
 
 		if q.qw+1 > q.qr+int64(len(q.q)) || q.w+int64(size) > q.r+q.b {
@@ -139,6 +184,19 @@ func (q *Queue) Commit(msg, size int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
+	q.commit(msg, size)
+}
+
+func (q *Queue) CommitN(ms []Message) {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	for _, m := range ms {
+		q.commit(m.Msg, m.End-m.Start)
+	}
+}
+
+func (q *Queue) commit(msg, size int) {
 	if size < 0 {
 		size = Cancel
 	}
@@ -149,13 +207,46 @@ func (q *Queue) Commit(msg, size int) {
 
 	q.q[msg].size = size
 
-	q.cond.Broadcast()
+	if size == Cancel {
+		q.done()
+	} else {
+		q.cond.Broadcast()
+	}
 }
 
 func (q *Queue) Consume(blocking bool) (msg, st, end int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
+	return q.consume(blocking)
+}
+
+func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	for n < len(buf) {
+		msg, st, end := q.consume(blocking && n == 0)
+		if msg < 0 && n > 0 {
+			return n
+		}
+		if msg < 0 {
+			return msg
+		}
+
+		buf[n] = Message{
+			Msg:   msg,
+			Start: st,
+			End:   end,
+		}
+
+		n++
+	}
+
+	return n
+}
+
+func (q *Queue) consume(blocking bool) (msg, st, end int) {
 	qmask := len(q.q) - 1
 	mask := int(q.b - 1)
 
@@ -192,9 +283,24 @@ func (q *Queue) Done(msg int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
-	qmask := len(q.q) - 1
-
 	q.q[msg].size = sizeFree
+
+	q.done()
+}
+
+func (q *Queue) DoneN(ms []Message) {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	for _, m := range ms {
+		q.q[m.Msg].size = sizeFree
+	}
+
+	q.done()
+}
+
+func (q *Queue) done() {
+	qmask := len(q.q) - 1
 
 	for q.qr < q.qw {
 		msg := int(q.qr) & qmask
@@ -229,6 +335,68 @@ func (q *Queue) Close() error {
 	return nil
 }
 
+func (q *Queue) len() int {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	qmask := len(q.q) - 1
+
+	n := 0
+
+	for msg := q.qr; msg < q.qw; msg++ {
+		m := int(msg) & qmask
+		s := q.q[m]
+
+		if s.size >= 0 {
+			n++
+		}
+	}
+
+	return n
+}
+
+func (q *Queue) Stats() (qr, qw, r, w int64) {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	return q.qr, q.qw, q.r, q.w
+}
+
+func (q *Queue) state() (x uint64) {
+	qmask := len(q.q) - 1
+
+	for msg := q.qr; msg < q.qw; msg++ {
+		m := int(msg) & qmask
+		s := q.q[m]
+
+		sh := 4 * int(msg-q.qr)
+		if sh >= 64 {
+			break
+		}
+
+		switch {
+		case s.size == sizeFree:
+			// x |= 0 << sh
+		case s.size == sizeWriting:
+			x |= 1 << sh
+		case s.size >= 0:
+			x |= 2 << sh
+		case s.size == sizeReading:
+			x |= 3 << sh
+		case s.size == Cancel:
+			x |= 4 << sh
+		default:
+			panic(s.size)
+		}
+	}
+
+	return x
+}
+
+func (q *Queue) pState() string {
+	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
+}
+
 func ToError(msg int64) error {
 	if msg >= 0 {
 		return nil
@@ -246,4 +414,10 @@ func (e ErrorCode) Error() string {
 	default:
 		return fmt.Sprintf("unknown error: %d", int(e))
 	}
+}
+
+func caller(d int) string {
+	_, file, line, _ := runtime.Caller(1 + d)
+
+	return fmt.Sprintf("%v:%v", filepath.Base(file), line)
 }

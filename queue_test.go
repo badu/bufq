@@ -12,7 +12,7 @@ import (
 )
 
 func TestQueue(tb *testing.T) {
-	const Q, N, T = 8, 10, 128
+	const Q, N, T = 8, 10, 1024
 
 	var wg, wwg sync.WaitGroup
 	var counter atomic.Int32
@@ -55,6 +55,53 @@ func TestQueue(tb *testing.T) {
 	}
 
 	wg.Add(N)
+	wwg.Add(N)
+
+	for i := range N {
+		go func() {
+			defer wg.Done()
+			defer wwg.Done()
+
+			ms := make([]bufq.Message, 3)
+
+			for {
+				m := q.AllocateN(15, 16, true, ms)
+				if m == bufq.Closed {
+					break
+				}
+				if m < 0 {
+					tb.Errorf("allocate: %x", m)
+					break
+				}
+
+				first := int(counter.Add(int32(m))) - m
+				x := first
+
+				for ; x < T && x < first+m; x++ {
+					msg := &ms[x-first]
+
+					res := fmt.Appendf(b[:msg.Start], "%04x N_%02x_%03x", x, i, msg.Msg)
+
+					msg.End = len(res)
+				}
+				for j := x; j < first+m; j++ {
+					ms[j-first].End = bufq.Cancel
+				}
+
+				runtime.Gosched()
+
+				q.CommitN(ms[:m])
+
+				runtime.Gosched()
+
+				if first+m >= T {
+					break
+				}
+			}
+		}()
+	}
+
+	wg.Add(N)
 
 	for i := range N {
 		go func() {
@@ -82,6 +129,46 @@ func TestQueue(tb *testing.T) {
 				runtime.Gosched()
 
 				q.Done(msg)
+
+				runtime.Gosched()
+			}
+		}()
+	}
+
+	wg.Add(N)
+
+	for i := range N {
+		go func() {
+			defer wg.Done()
+
+			ms := make([]bufq.Message, 3)
+
+			for {
+				m := q.ConsumeN(true, ms)
+				if m == bufq.Closed {
+					break
+				}
+				if m < 0 {
+					tb.Errorf("msg: %x", m)
+					break
+				}
+
+				for _, mm := range ms[:m] {
+					msg, st, end := mm.Msg, mm.Start, mm.End
+
+					tb.Logf("job %d_%x, msg %03x, bs %3x-%3x: %s", m, i, msg, st, end, b[st:end])
+
+					x, err := strconv.ParseUint(string(b[st:st+4]), 16, 32)
+					if err != nil {
+						tb.Errorf("parse x: %v", err)
+					}
+
+					read[x]++
+				}
+
+				runtime.Gosched()
+
+				q.DoneN(ms[:m])
 
 				runtime.Gosched()
 			}
