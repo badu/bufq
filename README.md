@@ -18,7 +18,7 @@ Buffer can be a slice or a mmapped file.
 Common pattarn is: there are one or more producers and one or more consumers.
 Each producer and consumer can produce/consume one or multiple messages at a time.
 
-Base use case: one udp reader reads packets as fast as it can into shared buffer and few workers process packets.
+Basic use case: one udp reader reads packets as fast as it can into shared buffer and few workers process packets.
 
 ```
 	type Meta struct {

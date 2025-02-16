@@ -34,7 +34,7 @@ type (
 		Start, End int
 	}
 
-	ErrorCode int
+	Error int
 )
 
 // Special msg values returned by Allocate and Consume meaning errors.
@@ -55,8 +55,8 @@ const (
 )
 
 var (
-	ErrClosed     = ErrorCode(Closed)
-	ErrWouldBlock = ErrorCode(WouldBlock)
+	ErrClosed     = Error(Closed)
+	ErrWouldBlock = Error(WouldBlock)
 )
 
 func New(n, buf int) *Queue {
@@ -155,7 +155,7 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 			q.w = q.w - q.w&(q.b-1) + q.b
 		}
 
-		if q.qw+1 > q.qr+int64(len(q.q)) || q.w+int64(size) > q.r+q.b {
+		if q.qw+1 > q.qr+q.qlen() || q.w+int64(size) > q.r+q.b {
 			if !blocking {
 				return WouldBlock, 0, 0
 			}
@@ -165,20 +165,17 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 			continue
 		}
 
-		qmask := int64(len(q.q) - 1)
-		mask := int(q.b) - 1
-
-		msg := q.qw & qmask
+		msg := q.qw
 		q.qw++
 
-		q.q[msg] = slot{start: q.w, size: sizeWriting}
+		q.q[q.Msg(msg)] = slot{start: q.w, size: sizeWriting}
 
-		st := int(q.w) & mask
+		st := int(q.w & q.mask())
 		end := st + size
 
 		q.w += int64(size)
 
-		return msg, st, end
+		return q.msg(msg), st, end
 	}
 }
 
@@ -203,22 +200,27 @@ func (q *Queue) commit(msg int64, size int) {
 		size = Cancel
 	}
 
-	if q.q[msg].size != sizeWriting {
+	if q.q[q.Msg(msg)].size != sizeWriting {
 		return
 	}
 
-	q.q[msg].size = size
+	q.q[q.Msg(msg)].size = size
 
-	if msg == q.qr && msg+1 == q.qw {
+	for q.qr < q.qw {
+		msg := q.Msg(q.qw - 1)
+		size := q.q[msg].size
+
 		if size == Cancel {
-			q.w = q.r
-		} else {
-			q.w = q.q[msg].start + int64(size)
+			q.qw--
+			q.w = q.q[msg].start
+			continue
 		}
+
+		break
 	}
 
-	if size == Cancel {
-		q.done(msg)
+	if size == Cancel && (msg^q.qr)&q.qmask() == 0 {
+		q.done()
 	} else {
 		q.cond.Broadcast()
 	}
@@ -257,22 +259,19 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 }
 
 func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
-	qmask := int64(len(q.q) - 1)
-	mask := int(q.b - 1)
-
 	for {
 		for msg := q.qr; msg < q.qw; msg++ {
-			s := q.q[msg&qmask]
+			s := q.q[q.Msg(msg)]
 			if s.size < 0 {
 				continue
 			}
 
-			st := int(s.start) & mask
+			st := int(s.start & q.mask())
 			end := st + s.size
 
-			q.q[msg&qmask].size = sizeReading
+			q.q[q.Msg(msg)].size = sizeReading
 
-			return msg & qmask, st, end
+			return q.msg(msg), st, end
 		}
 
 		if q.qr == q.qw && q.closed {
@@ -291,9 +290,11 @@ func (q *Queue) Done(msg int64) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
-	q.q[msg].size = sizeFree
+	q.q[q.Msg(msg)].size = sizeFree
 
-	q.done(msg)
+	if (msg^q.qr)&q.qmask() == 0 {
+		q.done()
+	}
 }
 
 func (q *Queue) DoneN(ms []Message) {
@@ -304,22 +305,22 @@ func (q *Queue) DoneN(ms []Message) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
+	clean := false
+
 	for _, m := range ms {
-		q.q[m.Msg].size = sizeFree
+		q.q[q.Msg(m.Msg)].size = sizeFree
+
+		clean = clean || (m.Msg^q.qr)&q.qmask() == 0
 	}
 
-	q.done(q.qr)
+	if clean {
+		q.done()
+	}
 }
 
-func (q *Queue) done(msg int64) {
-	qmask := len(q.q) - 1
-
-	if int(msg^q.qr)&qmask != 0 {
-		return
-	}
-
+func (q *Queue) done() {
 	for q.qr < q.qw {
-		msg := int(q.qr) & qmask
+		msg := q.Msg(q.qr)
 		size := q.q[msg].size
 
 		if size == Cancel || size == sizeFree {
@@ -333,7 +334,7 @@ func (q *Queue) done(msg int64) {
 	if q.qr == q.qw {
 		q.r = q.w
 	} else {
-		msg := int(q.qr) & qmask
+		msg := q.Msg(q.qr)
 		q.r = q.q[msg].start
 	}
 
@@ -355,13 +356,10 @@ func (q *Queue) len() int {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
-	qmask := len(q.q) - 1
-
 	n := 0
 
 	for msg := q.qr; msg < q.qw; msg++ {
-		m := int(msg) & qmask
-		s := q.q[m]
+		s := q.q[q.Msg(msg)]
 
 		if s.size >= 0 {
 			n++
@@ -379,10 +377,8 @@ func (q *Queue) Stats() (qr, qw, r, w int64) {
 }
 
 func (q *Queue) state() (x uint64) {
-	qmask := len(q.q) - 1
-
 	for msg := q.qr; msg < q.qw; msg++ {
-		m := int(msg) & qmask
+		m := q.Msg(msg)
 		s := q.q[m]
 
 		sh := 4 * int(msg-q.qr)
@@ -409,19 +405,24 @@ func (q *Queue) state() (x uint64) {
 	return x
 }
 
+func (q *Queue) Msg(msg int64) int64 { return msg & q.qmask() }
+func (q *Queue) msg(msg int64) int64 {
+	if q.FullMsg {
+		return msg
+	}
+
+	return q.Msg(msg)
+}
+
+func (q *Queue) qlen() int64  { return int64(len(q.q)) }
+func (q *Queue) qmask() int64 { return q.qlen() - 1 }
+func (q *Queue) mask() int64  { return q.b - 1 }
+
 func (q *Queue) pState() string {
 	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
 }
 
-func ToError(msg int64) error {
-	if msg >= 0 {
-		return nil
-	}
-
-	return ErrorCode(msg)
-}
-
-func (e ErrorCode) Error() string {
+func (e Error) Error() string {
 	switch e {
 	case Closed:
 		return "queue is closed"

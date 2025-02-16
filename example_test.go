@@ -3,6 +3,7 @@ package bufq_test
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/netip"
 	"runtime"
 	"sync"
@@ -41,13 +42,13 @@ func Example() {
 		defer q.Close()
 
 		defer func() {
-			fmt.Printf("reader finished: %v\n", err)
+			log.Printf("reader finished: %v\n", err)
 		}()
 
 		for {
 			msg, st, end := q.Allocate(MaxPacketSize, 16, true)
 			if msg < 0 {
-				return bufq.ToError(msg)
+				return bufq.Error(msg)
 			}
 
 			// meta[msg] and b[st:end] can be safely modified between Allocate and Commit calls.
@@ -68,23 +69,23 @@ func Example() {
 
 	wg.Add(Workers)
 
-	for worker := 0; worker < Workers; worker++ {
+	for worker := range Workers {
 		go func() (err error) {
 			defer wg.Done()
 
 			defer func() {
-				fmt.Printf("worker %d finished: %v\n", worker, err)
+				log.Printf("worker %d finished: %v\n", worker, err)
 			}()
 
 			for {
 				msg, st, end := q.Consume(true)
 				if msg < 0 {
-					return bufq.ToError(msg)
+					return bufq.Error(msg)
 				}
 
 				// meta[msg] and b[st:end] can be safely read between Consume and Done calls.
 
-				fmt.Printf("worker %d: message from %v: %s\n", worker, meta[msg].Addr, b[st:end])
+				log.Printf("worker %d: message from %v: %s\n", worker, meta[msg].Addr, b[st:end])
 
 				q.Done(msg)
 
@@ -95,7 +96,7 @@ func Example() {
 
 	wg.Wait()
 
-	// Output
+	// Output:
 }
 
 func newFakeNetPacketListener() *fakeNetPacketListener { return &fakeNetPacketListener{} }
@@ -105,7 +106,7 @@ func (p *fakeNetPacketListener) ReadFromUDPAddrPort(b []byte) (n int, addr netip
 		return 0, addr, io.EOF
 	}
 
-	res := fmt.Appendf(b[:0], "hello %4x", p.n)
+	res := fmt.Appendf(b[:0], "hello %4d", p.n)
 	p.n++
 
 	return len(res), netip.MustParseAddrPort("1.2.3.4:10000"), nil
