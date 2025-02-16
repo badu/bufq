@@ -20,7 +20,7 @@ Each producer and consumer can produce/consume one or multiple messages at a tim
 
 Basic use case: one udp reader reads packets as fast as it can into shared buffer and few workers process packets.
 
-```
+```go
 	type Meta struct {
 		Addr netip.AddrPort
 	}
@@ -32,7 +32,7 @@ Basic use case: one udp reader reads packets as fast as it can into shared buffe
 
 	q := bufq.New(len(meta), len(b))
 
-    var p *net.UDPConn // = ...
+	var p *net.UDPConn // = ...
 
 	go func() (err error) {
 		defer q.Close()
@@ -40,7 +40,7 @@ Basic use case: one udp reader reads packets as fast as it can into shared buffe
 		for {
 			msg, st, end := q.Allocate(MaxPacketSize, 16, true)
 			if msg < 0 {
-				return bufq.ToError(msg)
+				return bufq.Error(msg)
 			}
 
 			// meta[msg] and b[st:end] can be safely used between Allocate and Commit calls.
@@ -62,7 +62,7 @@ Basic use case: one udp reader reads packets as fast as it can into shared buffe
 			for {
 				msg, st, end := q.Consume(true)
 				if msg < 0 {
-					return bufq.ToError(msg)
+					return bufq.Error(msg)
 				}
 
 				// meta[msg] and b[st:end] can be safely used between Consume and Done calls.

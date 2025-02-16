@@ -19,8 +19,12 @@ func TestQueue(tb *testing.T) {
 
 	read := make([]byte, T)
 
+	meta := make([]int, Q)
 	b := make([]byte, 16*Q)
-	q := bufq.New(Q, len(b))
+
+	q := bufq.New(len(meta), len(b))
+
+	q.Flags |= 1 << bufq.FlagFullMsg
 
 	wg.Add(N)
 	wwg.Add(N)
@@ -44,6 +48,8 @@ func TestQueue(tb *testing.T) {
 
 				res := fmt.Appendf(b[:st], "%04x s_%02x_%03x", x, i, msg)
 				size := len(res) - st
+
+				meta[q.Msg(msg)] = i
 
 				runtime.Gosched()
 
@@ -83,6 +89,8 @@ func TestQueue(tb *testing.T) {
 					res := fmt.Appendf(b[:msg.Start], "%04x N_%02x_%03x", x, i, msg.Msg)
 
 					msg.End = len(res)
+
+					meta[q.Msg(msg.Msg)] = 0x1000 + i
 				}
 				for j := x; j < first+m; j++ {
 					ms[j-first].End = bufq.Cancel
@@ -117,7 +125,7 @@ func TestQueue(tb *testing.T) {
 					break
 				}
 
-				tb.Logf("job s_%x, msg %03x, bs %3x-%3x: %s", i, msg, st, end, b[st:end])
+				tb.Logf("job s_%x, msg %03x, bs %3x-%3x: %s  written by %4x", i, msg, st, end, b[st:end], meta[q.Msg(msg)])
 
 				x, err := strconv.ParseUint(string(b[st:st+4]), 16, 32)
 				if err != nil {
@@ -156,7 +164,7 @@ func TestQueue(tb *testing.T) {
 				for _, mm := range ms[:m] {
 					msg, st, end := mm.Msg, mm.Start, mm.End
 
-					tb.Logf("job %d_%x, msg %03x, bs %3x-%3x: %s", m, i, msg, st, end, b[st:end])
+					tb.Logf("job %d_%x, msg %03x, bs %3x-%3x: %s  written by %4x", m, i, msg, st, end, b[st:end], meta[q.Msg(msg)])
 
 					x, err := strconv.ParseUint(string(b[st:st+4]), 16, 32)
 					if err != nil {

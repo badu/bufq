@@ -21,7 +21,7 @@ type (
 
 		closed bool
 
-		FullMsg bool
+		Flags Flags
 	}
 
 	slot struct {
@@ -34,6 +34,7 @@ type (
 		Start, End int
 	}
 
+	Flags int
 	Error int
 )
 
@@ -52,6 +53,10 @@ const (
 	// sizeCommitted = positive size or Cancel
 	sizeReading
 	sizeFree
+)
+
+const (
+	FlagFullMsg = 1 << iota
 )
 
 var (
@@ -206,20 +211,18 @@ func (q *Queue) commit(msg int64, size int) {
 
 	q.q[q.Msg(msg)].size = size
 
-	for q.qr < q.qw {
-		msg := q.Msg(q.qw - 1)
-		size := q.q[msg].size
+	for msg := q.qw - 1; msg >= q.qr; msg-- {
+		size := q.q[q.Msg(msg)].size
 
 		if size == Cancel {
-			q.qw--
-			q.w = q.q[msg].start
+			q.w = q.q[q.Msg(msg)].start
 			continue
 		}
 
 		break
 	}
 
-	if size == Cancel && (msg^q.qr)&q.qmask() == 0 {
+	if size == Cancel && q.equal(msg, q.qr) {
 		q.done()
 	} else {
 		q.cond.Broadcast()
@@ -292,7 +295,7 @@ func (q *Queue) Done(msg int64) {
 
 	q.q[q.Msg(msg)].size = sizeFree
 
-	if (msg^q.qr)&q.qmask() == 0 {
+	if q.equal(msg, q.qr) {
 		q.done()
 	}
 }
@@ -310,7 +313,7 @@ func (q *Queue) DoneN(ms []Message) {
 	for _, m := range ms {
 		q.q[q.Msg(m.Msg)].size = sizeFree
 
-		clean = clean || (m.Msg^q.qr)&q.qmask() == 0
+		clean = clean || q.equal(m.Msg, q.qr)
 	}
 
 	if clean {
@@ -407,7 +410,7 @@ func (q *Queue) state() (x uint64) {
 
 func (q *Queue) Msg(msg int64) int64 { return msg & q.qmask() }
 func (q *Queue) msg(msg int64) int64 {
-	if q.FullMsg {
+	if q.Flags&(1<<FlagFullMsg) != 0 {
 		return msg
 	}
 
@@ -417,6 +420,8 @@ func (q *Queue) msg(msg int64) int64 {
 func (q *Queue) qlen() int64  { return int64(len(q.q)) }
 func (q *Queue) qmask() int64 { return q.qlen() - 1 }
 func (q *Queue) mask() int64  { return q.b - 1 }
+
+func (q *Queue) equal(x, y int64) bool { return (x^y)&q.qmask() == 0 }
 
 func (q *Queue) pState() string {
 	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
