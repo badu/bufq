@@ -26,10 +26,10 @@ func Example_n() {
 
 	// msgs := make([]ipv6.Message, 1024) // []golang.org/x/net/ipv6.Message
 
-	meta := make([]Meta, 0x1000)               // meta info buffer
-	b := make([]byte, len(meta)*MaxPacketSize) // data buffer
+	meta := make([]Meta, 0x1000)                    // meta info buffer
+	buffer := make([]byte, len(meta)*MaxPacketSize) // data buffer
 
-	q := bufq.New(len(meta), len(b))
+	q := bufq.New(len(meta), len(buffer))
 
 	p := newFakeBatchReader() // golang.org/x/net/ipv6.NewPacketConn(...)
 
@@ -55,19 +55,21 @@ func Example_n() {
 				defer q.CommitN(batch[:m])
 
 				for i := range m {
-					_ = i // msgs[i].Buffers[0] = s.Buf[b.Start:b.End]
+					st, end := batch[i].StartEnd()
+
+					_, _ = st, end // msgs[i].Buffers[0] = buffer[st:end]
 				}
 
-				used, err := p.ReadBatch(b, batch[:m]) // ipv6.PacketConn.ReadBatch(msgs[:m], flags)
+				used, err := p.ReadBatch(buffer, batch[:m]) // ipv6.PacketConn.ReadBatch(msgs[:m], flags)
 				if err == nil {
 					for i := range used {
 						// meta[msg].Addr = msgs[i].Addr
-						// ms[i].End = ms[i].Start + msgs[i].N
+						// batch[i].SetSize(msgs[i].N)
 						_ = i
 					}
 				}
 				for i := used; i < m; i++ {
-					batch[i].End = bufq.Cancel
+					batch[i].Cancel()
 				}
 
 				// q.ComminN is called with defer
@@ -102,8 +104,9 @@ func Example_n() {
 
 				for i := range m {
 					s := batch[i]
+					st, end := s.StartEnd()
 
-					log.Printf("worker %d: message: %s\n", worker, b[s.Start:s.End])
+					log.Printf("worker %d: message: %s\n", worker, buffer[st:end])
 				}
 
 				q.DoneN(batch[:m])
@@ -120,7 +123,7 @@ func Example_n() {
 
 func newFakeBatchReader() *fakeBatchReader { return &fakeBatchReader{} }
 
-func (p *fakeBatchReader) ReadBatch(b []byte, ms []bufq.Message) (int, error) {
+func (p *fakeBatchReader) ReadBatch(b []byte, batch []bufq.Message) (int, error) {
 	const N = 3
 
 	for i := 0; i < N; i++ {
@@ -128,8 +131,10 @@ func (p *fakeBatchReader) ReadBatch(b []byte, ms []bufq.Message) (int, error) {
 			return i, io.EOF
 		}
 
-		res := fmt.Appendf(b[:ms[i].Start], "hello %4d, batch %d/%d", p.n, i, len(ms))
-		ms[i].End = len(res)
+		st, _ := batch[i].StartEnd()
+
+		res := fmt.Appendf(b[:st], "hello %4d, batch %d/%d", p.n, i, len(batch))
+		batch[i].SetSize(len(res) - st)
 
 		p.n++
 	}

@@ -30,8 +30,9 @@ type (
 	}
 
 	Message struct {
-		Msg        int64
-		Start, End int
+		Msg int64
+
+		st, end int // end is used as size on commit
 	}
 
 	Flags int
@@ -65,13 +66,6 @@ var (
 )
 
 func New(n, buf int) *Queue {
-	if n&0x3 != 0 {
-		panic(n)
-	}
-	if buf&0xf != 0 {
-		panic(buf)
-	}
-
 	q := &Queue{}
 	q.Reset(n, buf)
 
@@ -83,6 +77,16 @@ func (q *Queue) ResetSame() {
 }
 
 func (q *Queue) Reset(n, buf int) {
+	if n&0x3 != 0 {
+		panic(n)
+	}
+	if buf&0xf != 0 {
+		panic(buf)
+	}
+	if n&(n-1) != 0 {
+		panic(n)
+	}
+
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
@@ -131,9 +135,9 @@ func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int)
 		}
 
 		buf[n] = Message{
-			Msg:   msg,
-			Start: st,
-			End:   end,
+			Msg: msg,
+			st:  st,
+			end: end,
 		}
 
 		n++
@@ -152,12 +156,12 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 			return Closed, 0, 0
 		}
 
-		if a := int64(align); a != 0 && q.w&(a-1) != 0 {
-			q.w = q.w - q.w&(a-1) + a
+		if a := int64(align); a != 0 && q.w%a != 0 {
+			q.w = q.w - q.w%a + a
 		}
 
-		if q.b != 0 && q.w&(q.b-1)+int64(size) > q.b {
-			q.w = q.w - q.w&(q.b-1) + q.b
+		if q.b != 0 && q.w%q.b+int64(size) > q.b {
+			q.w = q.w - q.w%q.b + q.b
 		}
 
 		if q.qw+1 > q.qr+q.qlen() || q.w+int64(size) > q.r+q.b {
@@ -175,7 +179,7 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 
 		q.q[q.Msg(msg)] = slot{start: q.w, size: sizeWriting}
 
-		st := int(q.w & q.mask())
+		st := q.start(q.w)
 		end := st + size
 
 		q.w += int64(size)
@@ -196,7 +200,7 @@ func (q *Queue) CommitN(ms []Message) {
 	q.mu.Lock()
 
 	for _, m := range ms {
-		q.commit(m.Msg, m.End-m.Start)
+		q.commit(m.Msg, m.end)
 	}
 }
 
@@ -209,20 +213,20 @@ func (q *Queue) commit(msg int64, size int) {
 		return
 	}
 
-	q.q[q.Msg(msg)].size = size
+	if size > 0 {
+		cur := q.q[q.Msg(msg)]
+		next := q.q[q.Msg(msg+1)]
 
-	for msg := q.qw - 1; msg >= q.qr; msg-- {
-		size := q.q[q.Msg(msg)].size
+		end := cur.start + int64(size)
 
-		if size == Cancel {
-			q.w = q.q[q.Msg(msg)].start
-			continue
+		if eq := q.equal(msg+1, q.qw); !eq && end > next.start || eq && end > q.w {
+			panic("bufq: Queue misuse: committed size is out of bounds")
 		}
-
-		break
 	}
 
-	if size == Cancel && q.equal(msg, q.qr) {
+	q.q[q.Msg(msg)].size = size
+
+	if size == Cancel {
 		q.done()
 	} else {
 		q.cond.Broadcast()
@@ -250,9 +254,9 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 		}
 
 		buf[n] = Message{
-			Msg:   msg,
-			Start: st,
-			End:   end,
+			Msg: msg,
+			st:  st,
+			end: end,
 		}
 
 		n++
@@ -269,7 +273,7 @@ func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
 				continue
 			}
 
-			st := int(s.start & q.mask())
+			st := q.start(s.start)
 			end := st + s.size
 
 			q.q[q.Msg(msg)].size = sizeReading
@@ -295,9 +299,7 @@ func (q *Queue) Done(msg int64) {
 
 	q.q[q.Msg(msg)].size = sizeFree
 
-	if q.equal(msg, q.qr) {
-		q.done()
-	}
+	q.done()
 }
 
 func (q *Queue) DoneN(ms []Message) {
@@ -308,17 +310,11 @@ func (q *Queue) DoneN(ms []Message) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
-	clean := false
-
 	for _, m := range ms {
 		q.q[q.Msg(m.Msg)].size = sizeFree
-
-		clean = clean || q.equal(m.Msg, q.qr)
 	}
 
-	if clean {
-		q.done()
-	}
+	q.done()
 }
 
 func (q *Queue) done() {
@@ -419,13 +415,47 @@ func (q *Queue) msg(msg int64) int64 {
 
 func (q *Queue) qlen() int64  { return int64(len(q.q)) }
 func (q *Queue) qmask() int64 { return q.qlen() - 1 }
-func (q *Queue) mask() int64  { return q.b - 1 }
+func (q *Queue) start(st int64) int {
+	if q.b == 0 {
+		return 0
+	}
+
+	return int(st % q.b)
+}
 
 func (q *Queue) equal(x, y int64) bool { return (x^y)&q.qmask() == 0 }
 
 func (q *Queue) pState() string {
 	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
 }
+
+/*
+func (q *Queue) String() string {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	return q.pState()
+}
+
+func (q *Queue) dump() string {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	var b strings.Builder
+
+	for msg := q.qr; msg < q.qw; msg++ {
+		s := q.q[q.Msg(msg)]
+
+		fmt.Fprintf(&b, "msg %4x: st %4x  size %3x\n", msg, s.start, s.size)
+	}
+
+	return b.String()
+}
+*/
+
+func (m *Message) StartEnd() (int, int) { return m.st, m.end }
+func (m *Message) SetSize(size int)     { m.end = size }
+func (m *Message) Cancel()              { m.end = Cancel }
 
 func (e Error) Error() string {
 	switch e {

@@ -12,6 +12,61 @@ import (
 )
 
 func TestQueue(tb *testing.T) {
+	const N = 5
+
+	meta := make([]int, 16)
+	ms := make([]bufq.Message, 2)
+
+	q := bufq.New(len(meta), 0)
+
+	for i := 0; i < N; i++ {
+		m := q.AllocateN(0, 0, false, ms)
+
+		for j := range ms[:m] {
+			msg := ms[j].Msg
+			meta[msg] = (len(ms)*i + j) * 7
+
+			tb.Logf("set msg %v  set %v", msg, meta[msg])
+		}
+
+		q.CommitN(ms[:m])
+	}
+
+	_ = q.Close()
+
+	exp := 0
+
+	for {
+		m := q.ConsumeN(false, ms)
+		if m == bufq.Closed {
+			break
+		}
+		if m < 0 {
+			tb.Errorf("consume: %v", bufq.Error(m))
+			break
+		}
+
+		for j := range ms[:m] {
+			msg := ms[j].Msg
+
+			tb.Logf("got msg %v  set %v", msg, meta[msg])
+
+			if meta[msg] != exp*7 {
+				tb.Errorf("wanted %v, got %v", exp, meta[j])
+			}
+
+			exp++
+		}
+
+		q.DoneN(ms[:m])
+	}
+
+	if exp != len(ms)*N {
+		tb.Errorf("wanted %v, got %v", exp, len(ms)*N)
+	}
+}
+
+func TestQueueParallel(tb *testing.T) {
 	const Q, N, T = 8, 10, 1024
 
 	var wg, wwg sync.WaitGroup
@@ -20,7 +75,7 @@ func TestQueue(tb *testing.T) {
 	read := make([]byte, T)
 
 	meta := make([]int, Q)
-	b := make([]byte, 16*Q)
+	b := make([]byte, 12*Q)
 
 	q := bufq.New(len(meta), len(b))
 
@@ -84,16 +139,17 @@ func TestQueue(tb *testing.T) {
 				x := first
 
 				for ; x < T && x < first+m; x++ {
-					msg := &ms[x-first]
+					mm := &ms[x-first]
+					st, _ := mm.StartEnd()
 
-					res := fmt.Appendf(b[:msg.Start], "%04x N_%02x_%03x", x, i, msg.Msg)
+					res := fmt.Appendf(b[:st], "%04x N_%02x_%03x", x, i, mm.Msg)
 
-					msg.End = len(res)
+					mm.SetSize(len(res) - st)
 
-					meta[q.Msg(msg.Msg)] = 0x1000 + i
+					meta[q.Msg(mm.Msg)] = 0x1000 + i
 				}
 				for j := x; j < first+m; j++ {
-					ms[j-first].End = bufq.Cancel
+					ms[j-first].Cancel()
 				}
 
 				runtime.Gosched()
@@ -162,7 +218,8 @@ func TestQueue(tb *testing.T) {
 				}
 
 				for _, mm := range ms[:m] {
-					msg, st, end := mm.Msg, mm.Start, mm.End
+					msg := mm.Msg
+					st, end := mm.StartEnd()
 
 					tb.Logf("job %d_%x, msg %03x, bs %3x-%3x: %s  written by %4x", m, i, msg, st, end, b[st:end], meta[q.Msg(msg)])
 
