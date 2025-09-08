@@ -7,18 +7,18 @@
 
 # bufq
 
-`bufq` is a queue for passing bytes buffers along with metadata in an efficient way.
-Initial task was to read and process 1GBit/s+ of small udp packets.
+`bufq` is a queue for efficiently passing chunks of a ring buffer along with their metadata.
+The initial task was to read and process over 1 Gbit/s of small UDP packets.
 
 ## Usage
 
-Queue operates only with indexes, it's unopinionated about buffer and metadata types and where they stored.
-Buffer can be a slice or a mmapped file.
+The queue operates solely with indexes, which makes it independent of the buffer and metadata types, as well as their storage locations.
+The buffer itself can be a slice, a memory-mapped file, or any other type.
 
-Common pattarn is: there are one or more producers and one or more consumers.
-Each producer and consumer can produce/consume one or multiple messages at a time.
+A common pattern is that there are one or more producers and one or more consumers.
+Each producer and consumer can produce or consume a single message or multiple messages at a time.
 
-Basic use case: one udp reader reads packets as fast as it can into shared buffer and few workers process packets.
+A basic example: a single UDP reader reads packets into a shared buffer as fast as it can, while a few workers process those packets.
 
 ```go
 	type Meta struct {
@@ -74,3 +74,6 @@ Basic use case: one udp reader reads packets as fast as it can into shared buffe
 		}()
 	}
 ```
+
+The reader might read a batch of packets at a time using [`ReadBatch`](https://pkg.go.dev/golang.org/x/net/ipv6#PacketConn.ReadBatch).
+In this case, `AllocateN` is used. Refer to the [example_n_test.go](example_n_test.go) for clarification.

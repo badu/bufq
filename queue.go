@@ -32,7 +32,8 @@ type (
 	Message struct {
 		Msg int64
 
-		st, end int // end is used as size on commit
+		Start int
+		Size  int
 	}
 
 	Flags int
@@ -45,8 +46,9 @@ const (
 	WouldBlock
 )
 
-// Special size values.
 const (
+	// Special size value passed to Commit and CommitN functions.
+	// Canceled message is skipped by consumers and returns to free list.
 	Cancel = -1
 
 	// slot states
@@ -57,12 +59,14 @@ const (
 )
 
 const (
+	// FlagFullMsg makes Allocate to return always increasing message number.
+	// Queue.Msg can be used to wrap it to buffer index.
 	FlagFullMsg = 1 << iota
 )
 
 var (
-	ErrClosed     = Error(Closed)
-	ErrWouldBlock = Error(WouldBlock)
+	ErrClosed     Error = Closed
+	ErrWouldBlock Error = WouldBlock
 )
 
 func New(n, buf int) *Queue {
@@ -82,9 +86,6 @@ func (q *Queue) Reset(n, buf int) {
 	}
 	if buf&0xf != 0 {
 		panic(buf)
-	}
-	if n&(n-1) != 0 {
-		panic(n)
 	}
 
 	defer q.mu.Unlock()
@@ -108,7 +109,7 @@ func (q *Queue) Reset(n, buf int) {
 
 func (q *Queue) Allocate(size, align int, blocking bool) (msg int64, st, end int) {
 	if align > 0 {
-		align = 1 << bits.Len(uint(align)-1)
+		align = alignAlign(align)
 	}
 
 	defer q.mu.Unlock()
@@ -119,7 +120,7 @@ func (q *Queue) Allocate(size, align int, blocking bool) (msg int64, st, end int
 
 func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int) {
 	if align > 0 {
-		align = 1 << bits.Len(uint(align)-1)
+		align = alignAlign(align)
 	}
 
 	defer q.mu.Unlock()
@@ -135,9 +136,9 @@ func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int)
 		}
 
 		buf[n] = Message{
-			Msg: msg,
-			st:  st,
-			end: end,
+			Msg:   msg,
+			Start: st,
+			Size:  end - st,
 		}
 
 		n++
@@ -200,7 +201,7 @@ func (q *Queue) CommitN(ms []Message) {
 	q.mu.Lock()
 
 	for _, m := range ms {
-		q.commit(m.Msg, m.end)
+		q.commit(m.Msg, m.Size)
 	}
 }
 
@@ -254,9 +255,9 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 		}
 
 		buf[n] = Message{
-			Msg: msg,
-			st:  st,
-			end: end,
+			Msg:   msg,
+			Start: st,
+			Size:  end - st,
 		}
 
 		n++
@@ -318,16 +319,23 @@ func (q *Queue) DoneN(ms []Message) {
 }
 
 func (q *Queue) done() {
+	var moved bool
+
 	for q.qr < q.qw {
 		msg := q.Msg(q.qr)
 		size := q.q[msg].size
 
 		if size == Cancel || size == sizeFree {
 			q.qr++
+			moved = true
 			continue
 		}
 
 		break
+	}
+
+	if !moved {
+		return
 	}
 
 	if q.qr == q.qw {
@@ -404,7 +412,7 @@ func (q *Queue) state() (x uint64) {
 	return x
 }
 
-func (q *Queue) Msg(msg int64) int64 { return msg & q.qmask() }
+func (q *Queue) Msg(msg int64) int64 { return msg % q.qlen() }
 func (q *Queue) msg(msg int64) int64 {
 	if q.Flags&(1<<FlagFullMsg) != 0 {
 		return msg
@@ -413,8 +421,7 @@ func (q *Queue) msg(msg int64) int64 {
 	return q.Msg(msg)
 }
 
-func (q *Queue) qlen() int64  { return int64(len(q.q)) }
-func (q *Queue) qmask() int64 { return q.qlen() - 1 }
+func (q *Queue) qlen() int64 { return int64(len(q.q)) }
 func (q *Queue) start(st int64) int {
 	if q.b == 0 {
 		return 0
@@ -423,7 +430,7 @@ func (q *Queue) start(st int64) int {
 	return int(st % q.b)
 }
 
-func (q *Queue) equal(x, y int64) bool { return (x^y)&q.qmask() == 0 }
+func (q *Queue) equal(x, y int64) bool { return q.Msg(x) == q.Msg(y) }
 
 func (q *Queue) pState() string {
 	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
@@ -453,9 +460,8 @@ func (q *Queue) dump() string {
 }
 */
 
-func (m *Message) StartEnd() (int, int) { return m.st, m.end }
-func (m *Message) SetSize(size int)     { m.end = size }
-func (m *Message) Cancel()              { m.end = Cancel }
+func (m Message) StartEnd() (int, int) { return m.Start, m.Start + m.Size }
+func (m *Message) Cancel()             { m.Size = Cancel }
 
 func (e Error) Error() string {
 	switch e {
@@ -466,6 +472,10 @@ func (e Error) Error() string {
 	default:
 		return fmt.Sprintf("unknown error: %d", int(e))
 	}
+}
+
+func alignAlign(align int) int {
+	return 1 << bits.Len(uint(align)-1)
 }
 
 func caller(d int) string {

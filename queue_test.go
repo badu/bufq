@@ -14,12 +14,12 @@ import (
 func TestQueue(tb *testing.T) {
 	const N = 5
 
-	meta := make([]int, 16)
+	meta := make([]int, 7*4)
 	ms := make([]bufq.Message, 2)
 
 	q := bufq.New(len(meta), 0)
 
-	for i := 0; i < N; i++ {
+	for i := range N {
 		m := q.AllocateN(0, 0, false, ms)
 
 		for j := range ms[:m] {
@@ -140,11 +140,10 @@ func TestQueueParallel(tb *testing.T) {
 
 				for ; x < T && x < first+m; x++ {
 					mm := &ms[x-first]
-					st, _ := mm.StartEnd()
 
-					res := fmt.Appendf(b[:st], "%04x N_%02x_%03x", x, i, mm.Msg)
+					res := fmt.Appendf(b[:mm.Start], "%04x N_%02x_%03x", x, i, mm.Msg)
 
-					mm.SetSize(len(res) - st)
+					mm.Size = len(res) - mm.Start
 
 					meta[q.Msg(mm.Msg)] = 0x1000 + i
 				}

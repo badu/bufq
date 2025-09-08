@@ -126,7 +126,7 @@ func newFakeBatchReader() *fakeBatchReader { return &fakeBatchReader{} }
 func (p *fakeBatchReader) ReadBatch(b []byte, batch []bufq.Message) (int, error) {
 	const N = 3
 
-	for i := 0; i < N; i++ {
+	for i := range N {
 		if p.n == 10 {
 			return i, io.EOF
 		}
@@ -134,7 +134,7 @@ func (p *fakeBatchReader) ReadBatch(b []byte, batch []bufq.Message) (int, error)
 		st, _ := batch[i].StartEnd()
 
 		res := fmt.Appendf(b[:st], "hello %4d, batch %d/%d", p.n, i, len(batch))
-		batch[i].SetSize(len(res) - st)
+		batch[i].Size = len(res) - st
 
 		p.n++
 	}
